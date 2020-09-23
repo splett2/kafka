@@ -78,7 +78,8 @@ import scala.util.control.ControlThrowable
 class SocketServer(val config: KafkaConfig,
                    val metrics: Metrics,
                    val time: Time,
-                   val credentialProvider: CredentialProvider)
+                   val credentialProvider: CredentialProvider,
+                   val connectionQuotaOpt: Option[ConnectionQuotas] = None)
   extends Logging with KafkaMetricsGroup with BrokerReconfigurable {
 
   private val maxQueuedRequests = config.queuedMaxRequests
@@ -100,9 +101,8 @@ class SocketServer(val config: KafkaConfig,
   private[network] var controlPlaneAcceptorOpt : Option[Acceptor] = None
   val controlPlaneRequestChannelOpt: Option[RequestChannel] = config.controlPlaneListenerName.map(_ =>
     new RequestChannel(20, ControlPlaneMetricPrefix, time))
-
+  private val connectionQuotas = connectionQuotaOpt.getOrElse(new ConnectionQuotas(config, time, metrics))
   private var nextProcessorId = 0
-  private var connectionQuotas: ConnectionQuotas = _
   private var startedProcessingRequests = false
   private var stoppedProcessingRequests = false
 
@@ -120,7 +120,6 @@ class SocketServer(val config: KafkaConfig,
    */
   def startup(startProcessingRequests: Boolean = true): Unit = {
     this.synchronized {
-      connectionQuotas = new ConnectionQuotas(config, time, metrics)
       createControlPlaneAcceptorAndProcessor(config.controlPlaneListener)
       createDataPlaneAcceptorsAndProcessors(config.numNetworkThreads, config.dataPlaneListeners)
       if (startProcessingRequests) {
@@ -1203,6 +1202,8 @@ class ConnectionQuotas(config: KafkaConfig, time: Time, metrics: Metrics) extend
   private val listenerCounts = mutable.Map[ListenerName, Int]()
   private[network] val maxConnectionsPerListener = mutable.Map[ListenerName, ListenerConnectionQuota]()
   @volatile private var totalCount = 0
+  @volatile private var defaultConnectionRatePerIp = Long.MaxValue
+  private val connectionRatePerIp = new ConcurrentHashMap[InetAddress, Long]()
 
   // sensor that tracks broker-wide connection creation rate and limit (quota)
   private val brokerConnectionRateSensor = createConnectionRateQuotaSensor(config.maxConnectionCreationRate)
@@ -1243,6 +1244,29 @@ class ConnectionQuotas(config: KafkaConfig, time: Time, metrics: Metrics) extend
     // if there is a connection waiting on the rate throttle delay, we will let it wait the original delay even if
     // the rate limit increases, because it is just one connection per listener and the code is simpler that way
     updateConnectionRateQuota(maxConnectionRate)
+  }
+
+  def updateIpConnectionRate(ip: Option[String], maxConnectionRate: Option[Long]): Unit = {
+    // if there is a connection waiting on the rate throttle delay, we will let it wait the original delay even if
+    // the rate limit increases, because it is just one connection per IP and the code is simpler that way
+    ip match {
+      case Some(addr) =>
+        val address = InetAddress.getByName(addr)
+        if (maxConnectionRate.isDefined) {
+          info(s"Updating max connection rate override for $address to ${maxConnectionRate.get}")
+          connectionRatePerIp.put(address, maxConnectionRate.get)
+        } else {
+          info(s"Removing max connection rate override for $address")
+          connectionRatePerIp.remove(address)
+        }
+      case None =>
+        info(s"Updating default max IP connection rate to ${maxConnectionRate.getOrElse(Long.MaxValue)}")
+        defaultConnectionRatePerIp = maxConnectionRate.getOrElse(Long.MaxValue)
+    }
+  }
+
+  def connectionRateForIp(ip: InetAddress): Long = {
+    connectionRatePerIp.getOrDefault(ip, defaultConnectionRatePerIp)
   }
 
   private[network] def addListener(config: KafkaConfig, listenerName: ListenerName): Unit = {

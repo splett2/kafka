@@ -295,7 +295,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         // Create and start the socket server acceptor threads so that the bound port is known.
         // Delay starting processors until the end of the initialization sequence to ensure
         // that credentials have been loaded before processing authentications.
-        socketServer = new SocketServer(config, metrics, time, credentialProvider)
+        socketServer = new SocketServer(config, metrics, time, credentialProvider, Some(quotaManagers.connections))
         socketServer.startup(startProcessingRequests = false)
 
         /* start replica manager */
@@ -374,7 +374,8 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         dynamicConfigHandlers = Map[String, ConfigHandler](ConfigType.Topic -> new TopicConfigHandler(logManager, config, quotaManagers, kafkaController),
                                                            ConfigType.Client -> new ClientIdConfigHandler(quotaManagers),
                                                            ConfigType.User -> new UserConfigHandler(quotaManagers, credentialProvider),
-                                                           ConfigType.Broker -> new BrokerConfigHandler(config, quotaManagers))
+                                                           ConfigType.Broker -> new BrokerConfigHandler(config, quotaManagers),
+                                                           ConfigType.Ip -> new IpConfigHandler(quotaManagers))
 
         // Create the config manager. start listening to notifications
         dynamicConfigManager = new DynamicConfigManager(zkClient, dynamicConfigHandlers)

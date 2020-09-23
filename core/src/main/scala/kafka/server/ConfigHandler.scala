@@ -185,6 +185,23 @@ class UserConfigHandler(private val quotaManagers: QuotaManagers, val credential
   }
 }
 
+class IpConfigHandler(private val quotaManagers: QuotaManagers) extends ConfigHandler with Logging {
+
+  def processConfigChanges(ip: String, config: Properties): Unit = {
+    val ipConnectionRateQuota =
+      if (config.containsKey(DynamicConfig.Ip.IpConnectionRateOverrideProp))
+        Some(config.getProperty(DynamicConfig.Ip.IpConnectionRateOverrideProp).toLong)
+      else
+        None
+    val updatedIp =
+      if (ip != ConfigEntityName.Default)
+        Some(ip)
+      else
+        None
+    quotaManagers.connections.updateIpConnectionRate(updatedIp, ipConnectionRateQuota)
+  }
+}
+
 /**
   * The BrokerConfigHandler will process individual broker config changes in ZK.
   * The callback provides the brokerId and the full properties set read from ZK.

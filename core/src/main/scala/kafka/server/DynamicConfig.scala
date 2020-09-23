@@ -127,6 +127,21 @@ object DynamicConfig {
     def validate(props: Properties) = DynamicConfig.validate(userConfigs, props, customPropsAllowed = false)
   }
 
+  object Ip {
+    val IpConnectionRateOverrideProp = "connection_creation_rate"
+    val DefaultConnectionCreationRate = Long.MaxValue
+    val IpOverrideDoc = "A long representing the upper bound of connections accepted for the specified IP."
+
+    private val ipConfigs = new ConfigDef()
+      .define(IpConnectionRateOverrideProp, LONG, DefaultConnectionCreationRate, atLeast(0), MEDIUM, IpOverrideDoc)
+
+    def configKeys = ipConfigs.configKeys
+
+    def names = ipConfigs.names
+
+    def validate(props: Properties) = DynamicConfig.validate(ipConfigs, props, customPropsAllowed = false)
+  }
+
   private def validate(configDef: ConfigDef, props: Properties, customPropsAllowed: Boolean) = {
     // Validate Names
     val names = configDef.names()
