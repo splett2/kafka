@@ -16,6 +16,7 @@
   */
 package kafka.server
 
+import kafka.network.ConnectionQuotas
 import kafka.server.QuotaType._
 import kafka.utils.Logging
 import org.apache.kafka.common.TopicPartition
@@ -61,6 +62,7 @@ object QuotaFactory extends Logging {
                            leader: ReplicationQuotaManager,
                            follower: ReplicationQuotaManager,
                            alterLogDirs: ReplicationQuotaManager,
+                           connections: ConnectionQuotas,
                            clientQuotaCallback: Option[ClientQuotaCallback]) {
     def shutdown(): Unit = {
       fetch.shutdown()
@@ -84,6 +86,7 @@ object QuotaFactory extends Logging {
       new ReplicationQuotaManager(replicationConfig(cfg), metrics, LeaderReplication, time),
       new ReplicationQuotaManager(replicationConfig(cfg), metrics, FollowerReplication, time),
       new ReplicationQuotaManager(alterLogDirsReplicationConfig(cfg), metrics, AlterLogDirsReplication, time),
+      new ConnectionQuotas(cfg, time, metrics),
       clientQuotaCallback
     )
   }
