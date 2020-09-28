@@ -437,6 +437,14 @@ class AdminManager(val config: KafkaConfig,
                 (name, value) => new DescribeConfigsResponseData.DescribeConfigsResourceResult().setName(name)
                   .setValue(value.toString).setConfigSource(ConfigSource.DYNAMIC_BROKER_LOGGER_CONFIG.id)
                   .setIsSensitive(false).setReadOnly(false).setSynonyms(List.empty.asJava))
+
+          case ConfigResource.Type.IP =>
+            val ip = resource.resourceName
+            val ipProps =
+              if (ip == null || ip.isEmpty)
+                adminZkClient.fetchEntityConfig(ConfigType.Ip)
+              else
+                adminZkClient.fetchEntityConfig(ConfigType.Ip, sanitizeEntityName(ip))
           case resourceType => throw new InvalidRequestException(s"Unsupported resource type: $resourceType")
         }
         configResult.setResourceName(resource.resourceName).setResourceType(resource.resourceType)
@@ -542,6 +550,19 @@ class AdminManager(val config: KafkaConfig,
     }
   }
 
+  private def alterIpConfigs(resource: ConfigResource, validateOnly: Boolean,
+                             configProps: Properties, configEntriesMap: Map[String, String]): (ConfigResource, ApiError) = {
+    val ip = resource.name
+    adminZkClient.validateIpConfig(ip, configProps)
+    validateConfigPolicy(resource, configEntriesMap)
+    if (!validateOnly) {
+      info(s"Updating $ip with new configuration $configProps")
+      adminZkClient.changeIpConfig(ip, configProps)
+    }
+
+    resource -> ApiError.NONE
+  }
+
   private def getBrokerId(resource: ConfigResource) = {
     if (resource.name == null || resource.name.isEmpty)
       None
@@ -603,6 +624,12 @@ class AdminManager(val config: KafkaConfig,
             if (!validateOnly)
               alterLogLevelConfigs(alterConfigOps)
             resource -> ApiError.NONE
+
+          case ConfigResource.Type.IP =>
+            val configProps = adminZkClient.fetchEntityConfig(ConfigType.Ip, resource.name)
+            prepareIncrementalConfigs(alterConfigOps, configProps, DynamicConfig.Ip.configKeys.asScala)
+            alterIpConfigs(resource, validateOnly, configProps,configEntriesMap)
+
           case resourceType =>
             throw new InvalidRequestException(s"AlterConfigs is only supported for topics and brokers, but resource type is $resourceType")
         }
@@ -727,7 +754,7 @@ class AdminManager(val config: KafkaConfig,
       case _ => DescribeConfigsResponse.ConfigType.UNKNOWN
     }
   }
-  
+
   private def configSynonyms(name: String, synonyms: List[String], isSensitive: Boolean): List[DescribeConfigsResponseData.DescribeConfigsSynonym] = {
     val dynamicConfig = config.dynamicConfig
     val allSynonyms = mutable.Buffer[DescribeConfigsResponseData.DescribeConfigsSynonym]()
