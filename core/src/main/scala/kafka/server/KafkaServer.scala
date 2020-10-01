@@ -295,7 +295,7 @@ class KafkaServer(val config: KafkaConfig, time: Time = Time.SYSTEM, threadNameP
         // Create and start the socket server acceptor threads so that the bound port is known.
         // Delay starting processors until the end of the initialization sequence to ensure
         // that credentials have been loaded before processing authentications.
-        socketServer = new SocketServer(config, metrics, time, credentialProvider, Some(quotaManagers.connections))
+        socketServer = new SocketServer(config, metrics, time, credentialProvider, quotaManagers.connections)
         socketServer.startup(startProcessingRequests = false)
 
         /* start replica manager */
