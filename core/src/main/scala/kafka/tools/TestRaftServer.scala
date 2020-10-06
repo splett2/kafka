@@ -309,7 +309,7 @@ class RaftSocketServer(
   time: Time,
   credentialProvider: CredentialProvider,
   logContext: LogContext
-) extends SocketServer(config, metrics, time, credentialProvider) {
+) extends SocketServer(config, metrics, time, credentialProvider, new ConnectionQuotas(config, time, metrics)) {
   override def newProcessor(
     id: Int,
     requestChannel: RequestChannel,

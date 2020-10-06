@@ -76,7 +76,7 @@ class SocketServerTest {
   // Clean-up any metrics left around by previous tests
   TestUtils.clearYammerMetrics()
 
-  val server = new SocketServer(config, metrics, Time.SYSTEM, credentialProvider)
+  val server = new SocketServer(config, metrics, Time.SYSTEM, credentialProvider, new ConnectionQuotas(config, Time.SYSTEM, metrics))
   server.startup()
   val sockets = new ArrayBuffer[Socket]
 
@@ -467,7 +467,8 @@ class SocketServerTest {
     val time = new MockTime()
     props.put(KafkaConfig.ConnectionsMaxIdleMsProp, idleTimeMs.toString)
     val serverMetrics = new Metrics
-    val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, time, credentialProvider)
+    val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, time, credentialProvider,
+      new ConnectionQuotas(KafkaConfig.fromProps(props), time, metrics))
 
     try {
       overrideServer.startup()
@@ -519,7 +520,8 @@ class SocketServerTest {
     val serverMetrics = new Metrics
     @volatile var selector: TestableSelector = null
     val overrideConnectionId = "127.0.0.1:1-127.0.0.1:2-0"
-    val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, time, credentialProvider) {
+    val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, time, credentialProvider,
+      new ConnectionQuotas(KafkaConfig.fromProps(props), time, metrics)) {
       override def newProcessor(id: Int, requestChannel: RequestChannel, connectionQuotas: ConnectionQuotas, listenerName: ListenerName,
                                 protocol: SecurityProtocol, memoryPool: MemoryPool, isPrivilegedListener: Boolean = false): Processor = {
         new Processor(id, time, config.socketRequestMaxBytes, dataPlaneRequestChannel, connectionQuotas,
@@ -783,15 +785,7 @@ class SocketServerTest {
     // then shutdown the server
     shutdownServerAndMetrics(server)
 
-    val largeChunkOfBytes = new Array[Byte](1000000)
-    // doing a subsequent send should throw an exception as the connection should be closed.
-    // send a large chunk of bytes to trigger a socket flush
-    try {
-      sendRequest(plainSocket, largeChunkOfBytes, Some(0))
-      fail("expected exception when writing to closed plain socket")
-    } catch {
-      case _: IOException => // expected
-    }
+    verifyRemoteConnectionClosed(plainSocket)
   }
 
   @Test
@@ -821,7 +815,8 @@ class SocketServerTest {
     val newProps = TestUtils.createBrokerConfig(0, TestUtils.MockZkConnect, port = 0)
     newProps.setProperty(KafkaConfig.MaxConnectionsPerIpProp, "0")
     newProps.setProperty(KafkaConfig.MaxConnectionsPerIpOverridesProp, "%s:%s".format("127.0.0.1", "5"))
-    val server = new SocketServer(KafkaConfig.fromProps(newProps), new Metrics(), Time.SYSTEM, credentialProvider)
+    val server = new SocketServer(KafkaConfig.fromProps(newProps), new Metrics(), Time.SYSTEM, credentialProvider,
+      new ConnectionQuotas(KafkaConfig.fromProps(newProps), Time.SYSTEM, metrics))
     try {
       server.startup()
       // make the maximum allowable number of connections
@@ -859,7 +854,8 @@ class SocketServerTest {
     val overrideProps = TestUtils.createBrokerConfig(0, TestUtils.MockZkConnect, port = 0)
     overrideProps.put(KafkaConfig.MaxConnectionsPerIpOverridesProp, s"localhost:$overrideNum")
     val serverMetrics = new Metrics()
-    val overrideServer = new SocketServer(KafkaConfig.fromProps(overrideProps), serverMetrics, Time.SYSTEM, credentialProvider)
+    val overrideServer = new SocketServer(KafkaConfig.fromProps(overrideProps), serverMetrics, Time.SYSTEM, credentialProvider,
+      new ConnectionQuotas(KafkaConfig.fromProps(overrideProps), Time.SYSTEM, metrics))
     try {
       overrideServer.startup()
       // make the maximum allowable number of connections
@@ -881,9 +877,70 @@ class SocketServerTest {
   }
 
   @Test
+  def testConnectionRatePerIp(): Unit = {
+    val overrideProps = TestUtils.createBrokerConfig(0, TestUtils.MockZkConnect, port = 0)
+    overrideProps.remove("max.connections.per.ip")
+    overrideProps.put(KafkaConfig.NumQuotaSamplesProp, String.valueOf(2))
+    val connectionRate = 5
+    val overrideServer = new SocketServer(KafkaConfig.fromProps(overrideProps), new Metrics(), Time.SYSTEM, credentialProvider,
+      new ConnectionQuotas(KafkaConfig.fromProps(overrideProps), Time.SYSTEM, metrics))
+    overrideServer.connectionQuotas.updateIpConnectionRate(None, Some(connectionRate))
+    try {
+      overrideServer.startup()
+      // make the maximum allowable number of connections
+      (0 until connectionRate).map(_ => connect(overrideServer))
+      // now try one more (should get throttled)
+      var conn = connect(overrideServer)
+      verifyRemoteConnectionClosed(conn)
+
+      // new connection should succeed after previous connection closed
+      conn = connect(overrideServer)
+      val serializedBytes = producerRequestBytes()
+      sendRequest(conn, serializedBytes)
+      val request = overrideServer.dataPlaneRequestChannel.receiveRequest(2000)
+      assertNotNull(request)
+    } finally {
+      shutdownServerAndMetrics(overrideServer)
+    }
+  }
+
+  @Test
+  def testThrottledSocketsClosedOnShutdown(): Unit = {
+    val overrideProps = TestUtils.createBrokerConfig(0, TestUtils.MockZkConnect, port = 0)
+    overrideProps.remove("max.connections.per.ip")
+    overrideProps.put(KafkaConfig.NumQuotaSamplesProp, String.valueOf(2))
+    val connectionRate = 5
+    val time = new MockTime()
+    val overrideServer = new SocketServer(KafkaConfig.fromProps(overrideProps), new Metrics(), time, credentialProvider,
+      new ConnectionQuotas(KafkaConfig.fromProps(overrideProps), time, metrics))
+    overrideServer.connectionQuotas.updateIpConnectionRate(None, Some(connectionRate))
+    overrideServer.startup()
+    // make the maximum allowable number of connections
+    (0 until connectionRate).map(_ => connect(overrideServer))
+    // now try one more (should get throttled)
+    val conn = connect(overrideServer)
+    // don't advance time so that connection never gets unthrottled
+    shutdownServerAndMetrics(overrideServer)
+    verifyRemoteConnectionClosed(conn)
+  }
+
+  private def verifyRemoteConnectionClosed(connection: Socket): Unit = {
+    val largeChunkOfBytes = new Array[Byte](1000000)
+    // doing a subsequent send should throw an exception as the connection should be closed.
+    // send a large chunk of bytes to trigger a socket flush
+    try {
+      sendRequest(connection, largeChunkOfBytes, Some(0))
+      fail("expected exception when writing to closed plain socket")
+    } catch {
+      case _: IOException => // expected
+    }
+  }
+
+  @Test
   def testSslSocketServer(): Unit = {
     val serverMetrics = new Metrics
-    val overrideServer = new SocketServer(KafkaConfig.fromProps(sslServerProps), serverMetrics, Time.SYSTEM, credentialProvider)
+    val overrideServer = new SocketServer(KafkaConfig.fromProps(sslServerProps), serverMetrics, Time.SYSTEM, credentialProvider,
+      new ConnectionQuotas(KafkaConfig.fromProps(sslServerProps), Time.SYSTEM, metrics))
     try {
       overrideServer.startup()
       val sslContext = SSLContext.getInstance(TestSslUtils.DEFAULT_TLS_PROTOCOL_FOR_TESTS)
@@ -1019,7 +1076,8 @@ class SocketServerTest {
     val props = TestUtils.createBrokerConfig(0, TestUtils.MockZkConnect, port = 0)
     val serverMetrics = new Metrics
     var conn: Socket = null
-    val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, Time.SYSTEM, credentialProvider) {
+    val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, Time.SYSTEM, credentialProvider,
+      new ConnectionQuotas(KafkaConfig.fromProps(props), Time.SYSTEM, metrics)) {
       override def newProcessor(id: Int, requestChannel: RequestChannel, connectionQuotas: ConnectionQuotas, listenerName: ListenerName,
                                 protocol: SecurityProtocol, memoryPool: MemoryPool, isPrivilegedListener: Boolean = false): Processor = {
         new Processor(id, time, config.socketRequestMaxBytes, dataPlaneRequestChannel, connectionQuotas,
@@ -1059,7 +1117,8 @@ class SocketServerTest {
   def testClientDisconnectionWithOutstandingReceivesProcessedUntilFailedSend(): Unit = {
     val serverMetrics = new Metrics
     @volatile var selector: TestableSelector = null
-    val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, Time.SYSTEM, credentialProvider) {
+    val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, Time.SYSTEM, credentialProvider,
+      new ConnectionQuotas(KafkaConfig.fromProps(props), Time.SYSTEM, metrics)) {
       override def newProcessor(id: Int, requestChannel: RequestChannel, connectionQuotas: ConnectionQuotas, listenerName: ListenerName,
                                 protocol: SecurityProtocol, memoryPool: MemoryPool, isPrivilegedListener: Boolean = false): Processor = {
         new Processor(id, time, config.socketRequestMaxBytes, dataPlaneRequestChannel, connectionQuotas,
@@ -1100,7 +1159,8 @@ class SocketServerTest {
     props.setProperty(KafkaConfig.ConnectionsMaxIdleMsProp, "110")
     val serverMetrics = new Metrics
     var conn: Socket = null
-    val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, Time.SYSTEM, credentialProvider)
+    val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, Time.SYSTEM, credentialProvider,
+      new ConnectionQuotas(KafkaConfig.fromProps(props), Time.SYSTEM, metrics))
     try {
       overrideServer.startup()
       conn = connect(overrideServer)
@@ -1814,7 +1874,7 @@ class SocketServerTest {
 
   class TestableSocketServer(config : KafkaConfig = KafkaConfig.fromProps(props), val connectionQueueSize: Int = 20,
                              override val time: Time = Time.SYSTEM) extends SocketServer(config,
-      new Metrics, time, credentialProvider) {
+      new Metrics, time, credentialProvider, new ConnectionQuotas(config, time, metrics)) {
 
     @volatile var selector: Option[TestableSelector] = None
     @volatile var uncaughtExceptions = 0

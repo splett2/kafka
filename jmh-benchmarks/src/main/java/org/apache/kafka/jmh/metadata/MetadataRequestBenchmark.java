@@ -20,6 +20,7 @@ package org.apache.kafka.jmh.metadata;
 import kafka.controller.KafkaController;
 import kafka.coordinator.group.GroupCoordinator;
 import kafka.coordinator.transaction.TransactionCoordinator;
+import kafka.network.ConnectionQuotas;
 import kafka.network.RequestChannel;
 import kafka.server.AdminManager;
 import kafka.server.BrokerTopicStats;
@@ -103,9 +104,10 @@ public class MetadataRequestBenchmark {
     private ClientRequestQuotaManager clientRequestQuotaManager = Mockito.mock(ClientRequestQuotaManager.class);
     private ControllerMutationQuotaManager controllerMutationQuotaManager = Mockito.mock(ControllerMutationQuotaManager.class);
     private ReplicationQuotaManager replicaQuotaManager = Mockito.mock(ReplicationQuotaManager.class);
+    private ConnectionQuotas connectionQuotas = Mockito.mock(ConnectionQuotas.class);
     private QuotaFactory.QuotaManagers quotaManagers = new QuotaFactory.QuotaManagers(clientQuotaManager,
         clientQuotaManager, clientRequestQuotaManager, controllerMutationQuotaManager, replicaQuotaManager,
-        replicaQuotaManager, replicaQuotaManager, Option.empty());
+        replicaQuotaManager, replicaQuotaManager, connectionQuotas, Option.empty());
     private FetchManager fetchManager = Mockito.mock(FetchManager.class);
     private BrokerTopicStats brokerTopicStats = new BrokerTopicStats();
     private KafkaPrincipal principal = new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "test-user");

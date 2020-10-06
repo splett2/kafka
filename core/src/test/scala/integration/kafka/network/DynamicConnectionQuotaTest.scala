@@ -23,11 +23,12 @@ import java.net.{InetAddress, Socket}
 import java.util.Properties
 import java.util.concurrent._
 
-import kafka.server.{BaseRequestTest, KafkaConfig}
+import kafka.server.{BaseRequestTest, DynamicConfig, KafkaConfig}
 import kafka.utils.TestUtils
 import org.apache.kafka.clients.admin.{Admin, AdminClientConfig}
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.protocol.Errors
+import org.apache.kafka.common.quota.ClientQuotaEntity
 import org.apache.kafka.common.record.{CompressionType, MemoryRecords, SimpleRecord}
 import org.apache.kafka.common.requests.{ProduceRequest, ProduceResponse}
 import org.apache.kafka.common.security.auth.SecurityProtocol
@@ -183,13 +184,13 @@ class DynamicConnectionQuotaTest extends BaseRequestTest {
     val connRateLimit = 18
 
     // before setting connection rate to 10, verify we can do at least double that by default (no limit)
-    verifyConnectionRate(2 * connRateLimit, Int.MaxValue, "PLAINTEXT")
+    verifyConnectionRate(2 * connRateLimit, Int.MaxValue, "PLAINTEXT", ignoreIOExceptions = false)
 
     // Reduce total broker connection rate limit to 18 at the cluster level and verify the limit is enforced
     props.clear()  // so that we do not pass security protocol map which cannot be set at the cluster level
     props.put(KafkaConfig.MaxConnectionCreationRateProp, connRateLimit.toString)
     reconfigureServers(props, perBrokerConfig = false, (KafkaConfig.MaxConnectionCreationRateProp, connRateLimit.toString))
-    verifyConnectionRate(10, connRateLimit, "PLAINTEXT")
+    verifyConnectionRate(10, connRateLimit, "PLAINTEXT", ignoreIOExceptions = false)
 
     // Set 7 conn/sec rate limit for each listener and verify it gets enforced
     val listenerConnRateLimit = 7
@@ -200,7 +201,7 @@ class DynamicConnectionQuotaTest extends BaseRequestTest {
 
     executor = Executors.newFixedThreadPool(newListenerNames.size)
     val futures = newListenerNames.map { listener =>
-      executor.submit((() => verifyConnectionRate(3, listenerConnRateLimit, listener)): Runnable)
+      executor.submit((() => verifyConnectionRate(3, listenerConnRateLimit, listener, ignoreIOExceptions = false)): Runnable)
     }
     futures.foreach(_.get(40, TimeUnit.SECONDS))
 
@@ -212,11 +213,26 @@ class DynamicConnectionQuotaTest extends BaseRequestTest {
     reconfigureServers(props, perBrokerConfig = true, (plaintextListenerProp, newPlaintextRateLimit.toString))
 
     val plaintextFuture = executor.submit((() =>
-      verifyConnectionRate(18, newPlaintextRateLimit, "PLAINTEXT")): Runnable)
+      verifyConnectionRate(18, newPlaintextRateLimit, "PLAINTEXT", ignoreIOExceptions = false)): Runnable)
     val externalFuture = executor.submit((() =>
-      verifyConnectionRate(5, listenerConnRateLimit, "EXTERNAL")): Runnable)
+      verifyConnectionRate(5, listenerConnRateLimit, "EXTERNAL", ignoreIOExceptions = false)): Runnable)
     plaintextFuture.get(40, TimeUnit.SECONDS)
     externalFuture.get(40, TimeUnit.SECONDS)
+  }
+
+  @Test
+  def testDynamicIpConnectionRateQuota(): Unit = {
+    val connRateLimit = 18
+    // before setting connection rate to 18, verify we can do at least double that by default (no limit)
+    verifyConnectionRate(2 * connRateLimit, Int.MaxValue, "PLAINTEXT", ignoreIOExceptions = false)
+    // set default IP connection rate quota, verify that we don't exceed the limit
+    updateIpConnectionRate(None, connRateLimit)
+    verifyConnectionRate(10, connRateLimit, "PLAINTEXT", ignoreIOExceptions = true)
+
+    // set a higher IP connection rate quota override, verify that the higher limit is now enforced
+    val newRateLimit = 22
+    updateIpConnectionRate(Some(localAddress.getHostAddress), newRateLimit)
+    verifyConnectionRate(18, newRateLimit, "PLAINTEXT", ignoreIOExceptions = true)
   }
 
   private def reconfigureServers(newProps: Properties, perBrokerConfig: Boolean, aPropToVerify: (String, String)): Unit = {
@@ -224,6 +240,22 @@ class DynamicConnectionQuotaTest extends BaseRequestTest {
     val adminClient = createAdminClient()
     TestUtils.incrementalAlterConfigs(servers, adminClient, newProps, perBrokerConfig).all.get()
     waitForConfigOnServer(aPropToVerify._1, aPropToVerify._2)
+    adminClient.close()
+    TestUtils.waitUntilTrue(() => initialConnectionCount == connectionCount,
+      s"Admin client connection not closed (initial = $initialConnectionCount, current = $connectionCount)")
+  }
+
+  private def updateIpConnectionRate(ip: Option[String], updatedRate: Int): Unit = {
+    val initialConnectionCount = connectionCount
+    val adminClient = createAdminClient()
+    val entity = new ClientQuotaEntity(Map(ClientQuotaEntity.IP -> ip.getOrElse(null)).asJava)
+    val request = Map(entity -> Map(DynamicConfig.Ip.IpConnectionRateOverrideProp -> Some(updatedRate.toDouble)))
+    TestUtils.alterClientQuotas(adminClient, request).all.get()
+    // use a random throwaway address if ip isn't specified to get the default value
+    TestUtils.waitUntilTrue(() => servers.head.socketServer.connectionQuotas.
+      connectionRateForIp(InetAddress.getByName(ip.getOrElse("255.255.3.4"))) == updatedRate,
+      s"Timed out waiting for connection rate update to propagate"
+    )
     adminClient.close()
     TestUtils.waitUntilTrue(() => initialConnectionCount == connectionCount,
       s"Admin client connection not closed (initial = $initialConnectionCount, current = $connectionCount)")
@@ -308,10 +340,13 @@ class DynamicConnectionQuotaTest extends BaseRequestTest {
     TestUtils.waitUntilTrue(() => initialConnectionCount == connectionCount, "Connections not closed")
   }
 
-  private def connectAndVerify(listener: String): Unit = {
+  private def connectAndVerify(listener: String, ignoreIOExceptions: Boolean): Unit = {
     val socket = connect(listener)
     try {
       sendAndReceive[ProduceResponse](produceRequest, socket)
+    } catch {
+      // IP rate throttling can lead to disconnected sockets on client's end
+      case e: IOException => if (!ignoreIOExceptions) throw e
     } finally {
       socket.close()
     }
@@ -325,7 +360,7 @@ class DynamicConnectionQuotaTest extends BaseRequestTest {
    * of actual rate is close to `maxConnectionRate`. Instead, use `minConnectionRate` parameter to verify that the rate
    * is at least certain value. Note that throttling is tested and verified more accurately in ConnectionQuotasTest
    */
-  private def verifyConnectionRate(minConnectionRate: Int, maxConnectionRate: Int, listener: String): Unit = {
+  private def verifyConnectionRate(minConnectionRate: Int, maxConnectionRate: Int, listener: String, ignoreIOExceptions: Boolean): Unit = {
     val initialConnectionCount = connectionCount
 
     // duration such that the maximum rate should be at most 10% higher than the rate limit. Since all connections
@@ -336,7 +371,7 @@ class DynamicConnectionQuotaTest extends BaseRequestTest {
 
     var connCount = 0
     while (System.currentTimeMillis < endTimeMs) {
-      connectAndVerify(listener)
+      connectAndVerify(listener, ignoreIOExceptions)
       connCount += 1
     }
     val elapsedMs = System.currentTimeMillis - startTimeMs
