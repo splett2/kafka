@@ -931,7 +931,7 @@ public final class QuorumController implements Controller {
     class QuorumMetaLogListener implements RaftClient.Listener<ApiMessageAndVersion> {
         @Override
         public void handleCommit(BatchReader<ApiMessageAndVersion> reader) {
-            appendRaftEvent("handleCommit[baseOffset=" + reader.baseOffset() + "]", () -> {
+            appendRaftEvent("handleCommit [baseOffset=" + reader.baseOffset() + "]", () -> {
                 try {
                     maybeCompleteAuthorizerInitialLoad();
                     long processedRecordsSize = 0;
@@ -995,7 +995,7 @@ public final class QuorumController implements Controller {
 
         @Override
         public void handleSnapshot(SnapshotReader<ApiMessageAndVersion> reader) {
-            appendRaftEvent(String.format("handleSnapshot[snapshotId=%s]", reader.snapshotId()), () -> {
+            appendRaftEvent(String.format("handleSnapshot [snapshotId=%s]", reader.snapshotId()), () -> {
                 try {
                     String snapshotName = Snapshots.filenameFromSnapshotId(reader.snapshotId());
                     if (isActiveController()) {
@@ -1046,7 +1046,7 @@ public final class QuorumController implements Controller {
 
         @Override
         public void handleLeaderChange(LeaderAndEpoch newLeader) {
-            appendRaftEvent("handleLeaderChange[" + newLeader.epoch() + "]", () -> {
+            appendRaftEvent("handleLeaderChange [" + newLeader.epoch() + "]", () -> {
                 final String newLeaderName = newLeader.leaderId().isPresent() ?
                         String.valueOf(newLeader.leaderId().getAsInt()) : "(none)";
                 if (isActiveController()) {
